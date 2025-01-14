@@ -1,0 +1,954 @@
+---
+title: "Main Analysis"
+author: "Astrid Stulemeijer"
+date: "2024-04-17"
+output: html_document
+---
+
+# Preparations
+## Loading needed packages, data & scripts
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Load R Packages
+library(RSiena)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(sna)
+library(network)
+library(RColorBrewer)
+library(GGally)
+library(reshape2)
+library(parallel)
+library(writexl)
+library(stats)
+library(car)
+library(ResourceSelection)
+library(RColorBrewer)
+library(grid)
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(tibble)
+
+# Load Data
+load("../Data/Input/Glasgow-friendship.RData")
+load("../Data/Input/Glasgow-demographic.RData")
+
+# Source Scripts
+source("./SimulationRun.R")
+source("./HelperFunctions.R")
+source("./FormatOutput.R")
+source("./AnalyzeOutput.R")
+source("./Graphs.R")
+
+# Set seed
+set.seed(3363430)
+```
+
+## Data Preparation
+```{r}
+# Only select actors that are active participants in both wave 2 and 3 
+noresponse_1 <- apply(friendship.2, 1, function(row) all(is.na(row) | row == 10))
+noresponse_2 <- apply(friendship.3, 1, function(row) all(is.na(row) | row == 10))
+inactive <- noresponse_1 | noresponse_2
+
+netwmatrices <- list(friendship.2[!inactive, !inactive], friendship.3[!inactive, !inactive]) %>%
+  lapply(., function(x) apply(x,1, function(y) replace(y,y == 2, 1))) # Create network without weights
+
+# Coding sex as 0/1
+sex <- ifelse(sex.F[!inactive] == 1, 0, 1)
+sex2 <- coCovar(sex, centered = F)
+```
+
+## Creating Relevant Objects
+```{r}
+controls <- sienaAlgorithmCreate(seed = 2809, cond = FALSE)
+
+# Creating "Real" SAOM model & second observations generated based on the second model
+if (file.exists("../Data/Output/RealModel.RData")){
+  realmodel <- readRDS("../Data/Output/RealModel.RData")
+  second_observations <- readRDS("../Data/Output/SecondObservations.RData")
+} else{
+  
+  # Real Model
+  friendship <- sienaDependent(array(c(netwmatrices[[1]], netwmatrices[[2]]), 
+                                   dim = c(133,133,2)))
+  glasgowdata <- sienaDataCreate(friendship, sex2)
+  
+  effects <- getEffects(glasgowdata)
+  effects <- includeEffects(effects, name = "friendship", 
+                            density, recip, cycle3, gwespFF, transRecTrip, inPop, inAct)
+  effects <- includeEffects(effects, name = "friendship", sameX, interaction1 = "sex2")
+  
+  realmodel <- siena07(controls, data = glasgowdata, effects = effects)
+  
+  # Second Observations
+  simulation_controls <- sienaAlgorithmCreate(seed = 2809, n3 = 1000, nsub = 0)
+  simulations <- siena07(simulation_controls, data = glasgowdata, effects = effects, 
+                   returnDeps = T, prevAns = realmodel)
+  
+  second_observations_list <- lapply(lapply(lapply(simulations$sims, "[[", "Data1"), "[[", "friendship"), 
+                                "[[", "1")
+  second_observations <- lapply(second_observations_list, EdgelistToMatrix)
+  
+  
+  saveRDS(realmodel, "../Data/Output/RealModel.RData")
+  saveRDS(second_observations, "../Data/Output/SecondObservations.RData")
+}
+
+```
+
+# Random Error Simulation
+## Settings for simulation
+```{r}
+n <- 1000
+neg_error <- c(0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
+pos_error <- c(0, 0.001)
+
+simulation_element <- expand.grid(1:n, neg_error, pos_error)
+
+simulation_input <- list(simulation_element, second_observations, netwmatrices, sex2, controls)
+names(simulation_input) <- c("simulation_element", "second_observations", 
+                             "netwmatrices", "sex2", "controls")
+save("simulation_input", file = "../Data/Input/InputSimulation.RData")
+```
+
+## Perform simulation [full version in ExecuteSimulationParallel.R for Supercomputer]
+```{r}
+# Actual simulation executed on supercomputer with ExecuteSimulationParallel.R
+# and SimulationRun.R
+
+cl <- makeCluster(3, outfile = "logs.txt")
+clusterExport(cl, c("SafeSimulation", "SimulationRun", "IntroduceError_Random_EqDensity", "second_observations", "netwmatrices", "sex2", "controls", "simulation_element", "ChangeCoding"))
+
+clusterEvalQ(cl, {library(igraph); library(RSiena)})
+
+random_output <- parApply(cl, MARGIN = 1, X = as.matrix(simulation_element), FUN = function(simulation_element) 
+    SimulationRun(IntroduceError_Random, netwmatrices[[1]], second_observations[[simulation_element[1]]], sex2,
+                  controls, simulation_element))
+
+stopCluster(cl)
+```
+
+## Output Formatting
+```{r}
+# Retrieve output from supercomputer, and load/calculate corresponding formatted data and results
+random_output <- readRDS("../Data/Output/01_Random_Raw_Output.RData")
+error_combo <- expand.grid(neg_error, pos_error)
+
+if (file.exists("../Data/Output/01_Random_Formatted_Output.RData")){
+  random_formatted <- readRDS("../Data/Output/01_Random_Formatted_Output.RData")
+  random_results <-readRDS("../Data/Output/01_Random_Results.RData") 
+  
+} else{
+  # Format output so it can be analyzed more easily
+  random_formatted <- FormatOutput(random_output)
+  saveRDS(random_formatted, "../Data/Output/01_Random_Formatted_Output.RData")
+  
+  # Most important analyses, defined beforehand
+  random_results <- AnalyzeOutput(random_output, random_formatted, realmodel, n, error_combo)
+  saveRDS(random_results, "../Data/Output/01_Random_Results.RData")
+}
+```
+
+# Analysis
+## Save basic output
+```{r}
+write_xlsx(list(
+  NetworkStats = random_results$summary_networkstats,
+  Parameters = random_results$summary_theta,
+  Convergence = random_results$convergencestats,
+  Change = random_results$change_statistics),
+  "../Results/Random/Simulation_RandomErrors.xlsx")
+```
+
+## Basic density graphs
+```{r}
+# Graph Dimensions per Parameter
+dimensions <- list(
+  # Order: x axis, y axis
+  c(6, 12),   # Rate 
+  c(-3.5, 0), # Density
+  c(1.5, 3.5), # Reciprocity
+  c(-2, 0), # Trans Recip
+  c(0, 2), # 3-cycle
+  c(1.5, 4), # GWESP
+  c(-0.5, 0), # Ind pop
+  c(-0.8, -0.1), # Ind act
+  c(0.2, 1.5), # Homophily
+  c(0, 0.85),
+  c(0, 1.75),
+  c(0, 2.5),
+  c(0, 4),
+  c(0, 4),
+  c(0, 2.5),
+  c(0, 11),
+  c(0, 8),
+  c(0, 4))
+
+# Density graphs per parameter
+sapply(1:9, function(x) 
+  SaveGraph(variable = random_results$summary_theta$Parameter[x], error_pos = 0, 
+            directory = "../Results/Random/", 
+            random_results = random_results, error_neg = unique(error_combo[,1])[seq(1,7,2)],
+            dimensions_x = dimensions[[x]], dimensions_y = dimensions[[x+9]]))
+
+sapply(1:9, function(x) 
+  SaveGraph(variable = random_results$summary_theta$Parameter[x], error_pos = 0.001, 
+            directory = "../Results/Random/", 
+            random_results = random_results, error_neg = unique(error_combo[,1])[seq(1,7,2)],
+            dimensions_x = dimensions[[x]], dimensions_y = dimensions[[x+9]]))
+
+```
+
+## Convergence analysis
+### Format data
+```{r}
+# Assess number of  succesfull initial runs and reruns, and subsequently the
+# initial convergence and initial rerun probabilities
+reruns_byerror_all <- as.data.frame(cbind(random_formatted$error_neg,
+                            random_formatted$error_pos, 
+                            random_formatted$convergence_reruns))
+colnames(reruns_byerror_all) <- c("Error_Neg", "Error_Pos", "Rerun")
+
+rerun_stats <- split(reruns_byerror_all, ~ as.factor(Error_Neg) + as.factor(Error_Pos)) %>%
+  sapply(., function(x) c(x$Error_Neg[1], x$Error_Pos[1], sum(x$Rerun))) %>%
+  t() %>%
+  as.data.frame()
+
+colnames(rerun_stats) <- c("Error_Neg", "Error_Pos", "Total_Reruns")
+
+reruns_succesful <- split(reruns_byerror_all[-random_results$noconvergence_indices,], 
+                          ~ as.factor(Error_Neg) + as.factor(Error_Pos)) %>%
+  sapply(., function(x) sum(x$Rerun)) 
+
+rerun_stats$Rerun_Success <- reruns_succesful
+rerun_stats <- rerun_stats %>%
+  mutate(Perc_Success = Rerun_Success/Total_Reruns,
+         Initial_Success = (1000 - Total_Reruns)/1000,
+         Ok_Reruns_Needed = Rerun_Success/(1000 - (Total_Reruns - Rerun_Success)),
+         Total_Useable = 1000-Total_Reruns+Rerun_Success)
+
+rownames(rerun_stats) <- NULL
+
+write_xlsx(rerun_stats, "../Results/Random/RerunStats.xlsx")
+```
+
+### Assess data - Initial success
+```{r}
+rerun_stats$Error_Neg_C <- scale(rerun_stats$Error_Neg, center = T, scale = F)
+rerun_stats$Error_Pos <- as.factor(rerun_stats$Error_Pos)
+
+# Check effect of error on success of initial runs and reruns
+conv_model <- glm(cbind((1000 - Total_Reruns), Total_Reruns) ~ Error_Neg_C * Error_Pos,
+                         data = rerun_stats, family = binomial)
+
+# Check assumptions
+vif(conv_model) # All below 4
+
+# There are some outliers
+rerun_stats$fittedprobInitial <- predict(conv_model, type = "response") 
+ggplot(rerun_stats, aes(x = fittedprobInitial, y = Initial_Success)) + 
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  labs(title = "Observed vs. Predicted Proportions",
+       x = "Predicted Proportion",
+       y = "Observed Proportion") +
+  theme_minimal()
+
+residuals <- residuals(conv_model, type = "deviance")
+plot(predict(conv_model), residuals)
+
+cooksD <- cooks.distance(conv_model)
+plot(cooksD, type = "h")
+
+# 1.6, so ok
+deviance(conv_model)/df.residual(conv_model)
+
+# Re-estimate model w/o outliers to see what happens
+rerun_stats_filtered <- rerun_stats[cooksD <= 4/14, ]
+conv_model_filter <- glm(cbind((1000 - Total_Reruns), Total_Reruns) ~ Error_Neg_C * Error_Pos,
+                         data = rerun_stats_filtered, family = binomial)
+rerun_stats_filtered$fittedprobInitial <- predict(conv_model_filter, type = "response") 
+
+ggplot(rerun_stats_filtered, aes(x = Error_Neg, y = Initial_Success, group = factor(Error_Pos), 
+                             colour = Error_Pos)) +
+  geom_point(size = 2) +
+  geom_line(aes(y = fittedprobInitial), linetype = "dashed", size = 1) +
+  scale_color_manual(values = c("#8E1652", "#7FBC41"), labels = c("0.000", "1.000")) +
+  ylim(0.55, 0.675) + 
+  labs(x = "Negative Error",
+       y = "Proportion Converged Initial Runs",
+       colour = "Positive Error") +
+  coord_fixed(ratio = 3) +
+  theme_minimal() +
+  theme(axis.title.y = element_text(margin = margin(r = 20)),
+        axis.title.x = element_text(margin = margin(t = 15)))
+
+# Display effects
+ggplot(rerun_stats, aes(x = Error_Neg, y = Initial_Success, group = factor(Error_Pos), 
+                             colour = Error_Pos)) +
+  geom_point(size = 2) +
+  geom_line(aes(y = fittedprobInitial), linetype = "dashed", size = 1) +
+  scale_color_manual(values = c("#8E1652", "#7FBC41"), labels = c("0.000", "0.001")) +
+  ylim(0.55, 0.675) + 
+  labs(x = "Negative Error",
+       y = "Proportion Converged Initial Runs",
+       colour = "Positive Error") +
+  coord_fixed(ratio = 3) +
+  theme_minimal() +
+  theme(axis.title.y = element_text(margin = margin(r = 20)),
+        axis.title.x = element_text(margin = margin(t = 15)))
+
+# Model significance
+initial_null <- glm(cbind((1000 - Total_Reruns), Total_Reruns) ~ 1,
+                         data = rerun_stats, family = binomial)
+anova(initial_null, conv_model, test = "Chisq")
+
+# Assess runs with error VS no error
+rerun_stats_error <- rerun_stats[, 1:4] %>%
+  mutate(NoError = ifelse(Error_Neg == 0 & Error_Pos == "0", 1, 0)) %>%
+  group_by(NoError) %>%
+  summarize(
+    Total_Reruns = sum(Total_Reruns),
+    Rerun_Success = sum(Rerun_Success),
+    Initial_Success = (1000*n()-Total_Reruns)/(1000*n()),
+    Second_Success = Rerun_Success/Total_Reruns,
+    n = n()*1000
+  )
+
+prop.test((rerun_stats_error$n-rerun_stats_error$Total_Reruns), rerun_stats_error$n)
+```
+
+### Assess data - Reruns
+```{r}
+# Check effect of error on success of reruns
+rerun_model2 <- glm(cbind(Rerun_Success, c((Total_Reruns - Rerun_Success))) ~ Error_Neg_C * Error_Pos,
+                         data = rerun_stats, family = binomial)
+
+rerun_stats$fittedprobRerun <- predict(rerun_model2, type = "response")
+
+# Check model fit
+ggplot(rerun_stats, aes(x = fittedprobRerun, y = Perc_Success)) + 
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  labs(title = "Observed vs. Predicted Proportions",
+       x = "Predicted Proportion",
+       y = "Observed Proportion") +
+  theme_minimal()
+
+residuals <- residuals(rerun_model2, type = "deviance")
+plot(predict(rerun_model2), residuals)
+
+cooksD <- cooks.distance(conv_model)
+plot(cooksD, type = "h")
+
+# Dispersion is ok
+deviance(rerun_model2)/df.residual(rerun_model2)
+
+# Rerun without outliers to see what happens - neg error becomes significant
+rerun_stats_filtered2 <- rerun_stats[cooksD <= 4/14, ]
+rerun_model_filter <- glm(cbind(Rerun_Success, c((Total_Reruns - Rerun_Success))) ~ Error_Neg_C * Error_Pos,
+                         data = rerun_stats_filtered2, family = binomial)
+rerun_stats_filtered2$fittedprobRerun <- predict(rerun_model_filter, type = "response") 
+
+ggplot(rerun_stats_filtered2, aes(x = Error_Neg, y = Perc_Success, group = factor(Error_Pos), 
+                             colour = Error_Pos)) +
+  geom_point(size = 2) +
+  geom_line(aes(y = fittedprobRerun), linetype = "dashed", size = 1) +
+  scale_color_manual(values = c("#8E1652", "#7FBC41"), labels = c("0.000", "1.000")) +
+  ylim(0.825, 0.95) + 
+  labs(x = "Negative Error",
+       y = "Proportion Converged Initial Runs",
+       colour = "Positive Error") +
+  coord_fixed(ratio = 3) +
+  theme_minimal() +
+  theme(axis.title.y = element_text(margin = margin(r = 20)),
+        axis.title.x = element_text(margin = margin(t = 15)))
+
+# Significance
+rerun_null <- glm(cbind(Rerun_Success, c((Total_Reruns - Rerun_Success))) ~ 1,
+                         data = rerun_stats, family = binomial)
+anova(rerun_null, rerun_model2, test = "Chisq")
+
+# Display effects
+ggplot(rerun_stats, aes(x = Error_Neg, y = Perc_Success, group = factor(Error_Pos), 
+                             colour = Error_Pos)) +
+  geom_point(size = 2) +
+  geom_line(aes(y = fittedprobRerun), linetype = "dashed", size = 1) +
+  scale_color_manual(values = c("#8E1652", "#7FBC41"), labels = c("0.000", "0.001")) +
+  ylim(0.825, 0.95) + 
+  labs(x = "Negative Error",
+       y = "Proportion Converged Reruns",
+       colour = "Positive Error") +
+  coord_fixed(ratio = 3) +
+  theme_minimal() +
+  theme(axis.title.y = element_text(margin = margin(r = 20)),
+        axis.title.x = element_text(margin = margin(t = 15)))
+
+# Error/No-Error Test
+prop.test(rerun_stats_error$Rerun_Success, rerun_stats_error$Total_Reruns)
+```
+
+## SAOM parameter analysis
+#### Regression of SAOM parameters
+```{r}
+all_par_data <- random_results$filtered_output$theta
+all_par_data$Error_Pos <- as.factor(all_par_data$Error_Pos)
+all_par_data$Error_Neg_C <- scale(all_par_data$Error_Neg, center = T, scale = F)
+
+###### Rate ######
+# Assumptions seem ok - some deviation from normality in tail but not that important with this large n
+rate_model <- lm((Rate-realmodel$theta[1])/realmodel$theta[1] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(rate_model)
+
+###### Density ######
+# Assumptions seem ok - but same
+density_model <- lm((Density-realmodel$theta[2])/realmodel$theta[2] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(density_model)
+
+###### Reciprocity ######
+reciprocity_model <- lm((Reciprocity-realmodel$theta[3])/realmodel$theta[3] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(reciprocity_model)
+
+###### Trans rec triplets ######
+rectrip_model <- lm((`Transitivity-Reciprocity`-realmodel$theta[4])/realmodel$theta[4] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(rectrip_model)
+
+###### 3-cycle ######
+cycle3_model <- lm((`3-cycles`-realmodel$theta[5])/realmodel$theta[5] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(cycle3_model)
+
+###### GWESP ######
+gwesp_model <- lm((GWESP-realmodel$theta[6])/realmodel$theta[6] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(gwesp_model)
+
+###### Indegree - Popularity ######
+# Residuals > 2 deviate from normality line 
+indpop_model <- lm((`Indegree Popularity`-realmodel$theta[7])/realmodel$theta[7] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(indpop_model)
+
+# Check for differences with log-transformed dependent variable
+# Conclusions are not really different and model fit actually seems worse.
+# The original model is therefore the final model, for the sake of interpretability
+all_par_data$indpop <- (all_par_data$`Indegree Popularity`-realmodel$theta[7])/realmodel$theta[7]
+all_par_data$indpop_2 <- all_par_data$indpop + abs(min(all_par_data$indpop)) + 1
+indpop_model2 <- lm(indpop_2 ~ Error_Neg_C * Error_Pos, data = all_par_data)
+boxcox_result <- boxcox(indpop_model2)
+boxcox_result$x[which.max(boxcox_result$y)] # 0.06
+indpop_model3 <- lm(log(indpop_2) ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(indpop_model3)
+
+###### Indegree Activity ######
+# Same scenario as above - use original model
+indact_model <- lm((`Indegree Activity`-realmodel$theta[8])/realmodel$theta[8] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(indact_model)
+
+all_par_data$indact <- (all_par_data$`Indegree Activity`-realmodel$theta[8])/realmodel$theta[8]
+all_par_data$indact_2 <- all_par_data$indact + abs(min(all_par_data$indact)) + 1
+indact_model2 <- lm(indact_2 ~ Error_Neg_C * Error_Pos, data = all_par_data)
+boxcox_result <- boxcox(indact_model2)
+boxcox_result$x[which.max(boxcox_result$y)] # -0.22
+indact_model3 <- lm(log(indact_2) ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(indact_model3)
+
+###### Sex homophily ######
+# Same scenario as two above. However, again no conclusion differences, and only
+# an increase in adj r2 of 0.0008 which is negligible. 
+# For interpretability - use original model
+hom_model <- lm((`Homophily-Sex`-realmodel$theta[9])/realmodel$theta[9] ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(hom_model)
+
+all_par_data$hom <- (all_par_data$`Homophily-Sex`-realmodel$theta[9])/realmodel$theta[9]
+all_par_data$hom_2 <- all_par_data$hom + abs(min(all_par_data$hom)) + 1
+hom_model2 <- lm(hom_2 ~ Error_Neg_C * Error_Pos, data = all_par_data)
+boxcox_result <- boxcox(hom_model2)
+boxcox_result$x[which.max(boxcox_result$y)] # -0.06
+hom_model3 <- lm(log(hom_2) ~ Error_Neg_C * Error_Pos, data = all_par_data)
+plot(hom_model3)
+
+# Predictions
+prediction_object <- unique(all_par_data[, c(10,11,13)])
+# Apply predictions for each model to the prediction_object
+prediction_object$rate <- predict(rate_model, prediction_object)
+prediction_object$density <- predict(density_model, prediction_object)
+prediction_object$reciprocity <- predict(reciprocity_model, prediction_object)
+prediction_object$rectrip <- predict(rectrip_model, prediction_object)
+prediction_object$cycle3 <- predict(cycle3_model, prediction_object)
+prediction_object$gwesp <- predict(gwesp_model, prediction_object)
+prediction_object$indpop <- predict(indpop_model, prediction_object)
+prediction_object$indact <- predict(indact_model, prediction_object)
+prediction_object$hom <- predict(hom_model, prediction_object)
+
+```
+
+#### Collect all p values for holm correction
+```{r}
+P_vals_random <- c(
+  summary(rate_model)$coefficients[,4],
+  summary(density_model)$coefficients[,4],
+  summary(reciprocity_model)$coefficients[,4],
+  summary(rectrip_model)$coefficients[,4],
+  summary(cycle3_model)$coefficients[,4],
+  summary(gwesp_model)$coefficients[,4],
+  summary(indpop_model)$coefficients[,4],
+  summary(indact_model)$coefficients[,4],
+  summary(hom_model)$coefficients[,4]
+)
+
+name_dependent <- rep(names(all_par_data)[1:9], each = 4)
+var_names <- rep(c("Intercept", "Neg", "Pos", "X"), 9)
+
+names(P_vals_random) <- sapply(1:length(name_dependent), 
+                               function(i) paste0("R_", name_dependent[i], "_", var_names[i]))
+
+saveRDS(P_vals_random, "../Results/Random/PvalsRandom.RData")
+```
+
+## Assess sign changes
+```{r}
+for (i in 1:9){
+  colname <- paste0(colnames(all_par_data)[i], "_signchange")
+  real_value <- random_results$summary_theta$Real_Theta[i]
+  
+  # check if sign the same to true parameter
+  all_par_data[[colname]] <- ifelse((all_par_data[,i] * real_value) > 0, 0, 1)
+}
+
+sign_results <- all_par_data[, c(10, 11, 22:30)] %>%
+  group_by(Error_Neg, Error_Pos) %>%
+  summarize(across(ends_with("_signchange"), mean, .names = "mean_{col}"))
+``` 
+
+## SAOM summary graphs
+```{r}
+# No positive error
+# Coverage
+data <- random_results$summary_theta
+data$Parameter <- factor(data$Parameter, levels = unique(data$Parameter))
+data$Variance_std <- ave((data$SE^2), data$Parameter, FUN = function(x) (x - mean(x)) / sd(x))
+ggplot(data[data$Error_Pos == 0,], 
+       aes(x = Error_Neg, y = Coverage, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  geom_hline(yintercept = 0.95) + 
+  scale_color_brewer(palette = "Paired") + 
+  labs(x = "Negative Error Rate", y = "Coverage", colour = "Parameter") +
+  coord_fixed(ratio = 0.22) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Relative bias
+ggplot(data[data$Error_Pos == 0,], 
+       aes(x = Error_Neg, y = Rel_Bias, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Paired") + 
+  theme_minimal() +
+  labs(x = "Negative Error Rate", y = "Relative Bias (%)", colour = "Parameter") +
+  lims(y = c(-20, 175)) +
+  coord_fixed(ratio = 0.0012) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Variance
+ggplot(data[data$Error_Pos == 0,], 
+       aes(x = Error_Neg, y = Variance_std, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Paired") + 
+  theme_minimal() +
+  labs(x = "Negative Error Rate", y = "Standardized Variance", colour = "Parameter") +
+  lims(y = c(-3, 3)) +
+  coord_fixed(ratio = 0.04) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Percentile Rank
+ggplot(data[data$Error_Pos == 0,], 
+       aes(x = Error_Neg, y = Percentile_Rank, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  geom_hline(yintercept = 0.5) + 
+  scale_color_brewer(palette = "Paired") + 
+  labs(x = "Negative Error (Baseline)", y = "Percentile Rank", colour = "Parameter") +
+  coord_fixed(ratio = 0.25) +
+  lims(y = c(0, 1)) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# With positive error
+# Coverag
+ggplot(data[data$Error_Pos == 0.001,], 
+       aes(x = Error_Neg, y = Coverage, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  geom_hline(yintercept = 0.95) + 
+  scale_color_brewer(palette = "Paired") + 
+  labs(x = "Negative Error Rate", y = "Coverage", colour = "Parameter") +
+  coord_fixed(ratio = 0.22) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Relative bias
+data$Parameter <- factor(data$Parameter, levels = unique(data$Parameter))
+ggplot(data[data$Error_Pos == 0.001,], 
+       aes(x = Error_Neg, y = Rel_Bias, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Paired") + 
+  theme_minimal() +
+  labs(x = "Negative Error Rate", y = "Relative Bias (%)", colour = "Parameter") +
+  lims(y = c(-20, 175)) +
+  coord_fixed(ratio = 0.0012) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Variance
+data$Parameter <- factor(data$Parameter, levels = unique(data$Parameter))
+ggplot(data[data$Error_Pos == 0.001,], 
+       aes(x = Error_Neg, y = Variance_std, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  scale_color_brewer(palette = "Paired") + 
+  theme_minimal() +
+  labs(x = "Negative Error Rate", y = "Standardized Variance", colour = "Parameter") +
+  lims(y = c(-3, 03)) +
+  coord_fixed(ratio = 0.04) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+
+# Percentile Rank
+ggplot(data[data$Error_Pos == 0.001,], 
+       aes(x = Error_Neg, y = Percentile_Rank, group = as.factor(Parameter), 
+           colour = as.factor(Parameter))) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  geom_hline(yintercept = 0.5) + 
+  scale_color_brewer(palette = "Paired") + 
+  labs(x = "Negative Error (Baseline)", y = "Percentile Rank", colour = "Parameter") +
+  coord_fixed(ratio = 0.25) +
+  lims(y = c(0, 1)) +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 12),
+      axis.title.x = element_text(margin = margin(t = 15), size = 12),
+      legend.position = "none",
+      axis.text.x = element_text(size = 11),
+      axis.text.y = element_text(size = 11))
+```
+
+## Network graphs
+### Network statistics by error combination
+```{r}
+to_visualize <- random_results$summary_networkstats[,-c(8:12)] %>%
+  mutate(network = rep(c("obs1", "obs2", "an1", "an2"), 14),
+         
+         # Standardize statistics to 0-1 scale to fit in the graph
+         Components = (Components - min(Components, na.rm = TRUE)) / 
+           (max(Components, na.rm = TRUE) - min(Components, na.rm = TRUE)),
+         Med_Distance = ifelse(is.infinite(Med_Distance), NA, Med_Distance), 
+         Med_Distance = (Med_Distance - min(Med_Distance, na.rm = TRUE)) / 
+           (max(Med_Distance, na.rm = TRUE) - min(Med_Distance, na.rm = TRUE))) %>%
+  filter(!(network %in% c("obs1", "obs2"))) %>%
+  pivot_longer(., cols = 3:7, names_to = "Statistic", values_to = "Value")
+
+# Start network - no positive error
+ggplot(to_visualize[to_visualize$network == "an1" & to_visualize$Error_Pos == 0,],
+       aes(x = Error_Neg, y = Value, group = Statistic, colour = Statistic)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_discrete(labels = c("Components \n (0-1 scaled)", "Density",
+                                  "Med Distance \n (0-1 scaled)", "Reciprocity",
+                                  "Transitivity")) +
+  labs(x = "Negative Error Rate") +
+  theme(
+    axis.title.y = element_text(margin = margin(r = 15)),
+    axis.title.x = element_text(margin = margin(t = 15)),
+    legend.title.align = 0,          
+    legend.text.align = 0,           
+    legend.spacing.y = unit(5, "cm"),
+    legend.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  coord_fixed(ratio = 0.3) +
+  lims(y = c(0,1))
+
+# End network - no positive error
+ggplot(to_visualize[to_visualize$network == "an2" & to_visualize$Error_Pos == 0,],
+       aes(x = Error_Neg, y = Value, group = Statistic, colour = Statistic)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_discrete(labels = c("Components \n (0-1 scaled)", "Density",
+                                  "Med Distance \n (0-1 scaled)", "Reciprocity",
+                                  "Transitivity")) +
+  labs(x = "Negative Error Rate") +
+  theme(
+    axis.title.y = element_text(margin = margin(r = 15)),
+    axis.title.x = element_text(margin = margin(t = 15)),
+    legend.title.align = 0,          
+    legend.text.align = 0,           
+    legend.spacing.y = unit(5, "cm"),
+    legend.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  coord_fixed(ratio = 0.3) +
+  lims(y = c(0,1))
+
+# Start network - positive error
+ggplot(to_visualize[to_visualize$network == "an1" & to_visualize$Error_Pos == 0.001,],
+       aes(x = Error_Neg, y = Value, group = Statistic, colour = Statistic)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_discrete(labels = c("Components \n (0-1 scaled)", "Density",
+                                  "Med Distance \n (0-1 scaled)", "Reciprocity",
+                                  "Transitivity")) +
+  labs(x = "Negative Error Rate") +
+  theme(
+    axis.title.y = element_text(margin = margin(r = 15)),
+    axis.title.x = element_text(margin = margin(t = 15)),
+    legend.title.align = 0,          
+    legend.text.align = 0,           
+    legend.spacing.y = unit(5, "cm"),
+    legend.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  coord_fixed(ratio = 0.3) +
+  lims(y = c(0,1))
+
+# End network - positive error
+ggplot(to_visualize[to_visualize$network == "an2" & to_visualize$Error_Pos == 0.001,],
+       aes(x = Error_Neg, y = Value, group = Statistic, colour = Statistic)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_discrete(labels = c("Components \n (0-1 scaled)", "Density",
+                                  "Med Distance \n (0-1 scaled)", "Reciprocity",
+                                  "Transitivity")) +
+  labs(x = "Negative Error Rate") +
+  theme(
+    axis.title.y = element_text(margin = margin(r = 15)),
+    axis.title.x = element_text(margin = margin(t = 15)),
+    legend.title.align = 0,          
+    legend.text.align = 0,           
+    legend.spacing.y = unit(5, "cm"),
+    legend.text = element_text(size = 9),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  coord_fixed(ratio = 0.3) +
+  lims(y = c(0,1))
+
+```
+
+### Network visualizations
+```{r}
+# Select networks with neg error rate = 0 and 0.2, with network index 
+# (Equal index = same simulated network trajectory)
+index_visualizations <- c(2, 4002, 11002)
+random_formatted$convergence_reruns[index_visualizations] # all converged on the first run
+
+networks_no_error <- random_formatted$analyzed_networks[[2]]
+networks_no_pos <- random_formatted$analyzed_networks[[4002]]
+networks_pos <- random_formatted$analyzed_networks[[11002]]
+all_networks <- list(networks_no_error[,,2],
+                     networks_no_pos[,,2],
+                     networks_pos[,,2])
+
+netwobjects <- lapply(all_networks, function(x) network(x, directed = T))
+
+### Visualiations without errors ###
+# Timepoint 2
+t2 <- netwobjects[[1]]
+set.vertex.attribute(t2, "Sex", as.character(sex))
+
+set.seed(2809)
+t2_igraph <- graph_from_adjacency_matrix(as.matrix.network.adjacency(t2), mode = "directed")
+layout_fixed <- layout_with_fr(t2_igraph)
+layout_fixed <- saveRDS("../Results/Exploration/layout_network_graphs.RData")
+#layout_fixed <- readRDS("../Results/Exploration/layout_network_graphs.RData")
+
+# Assign fixed layout coordinates to the second network
+set.vertex.attribute(t2, "x", layout_fixed[, 1])
+set.vertex.attribute(t2, "y", layout_fixed[, 2])
+
+# Timepoint 2 visualization without error
+ggnet2(t2, node.color = "Sex",
+       arrow.size = 3, arrow.gap = 0.015, 
+       node.size = 4, legend.position = "right",
+       mode = c("x", "y")) +
+  guides(size = F) +
+  scale_color_manual(
+    values = c("1" = "pink", "0" = "lightblue"),
+    labels = c("1" = "Girls", "0" = "Boys"),
+    name = "Sex") +
+  ggtitle("End network - No error") 
+  theme(plot.title = element_text(face = "bold"))
+
+#### Visualizations with only negative error ###  
+t2_error <- netwobjects[[2]]
+set.vertex.attribute(t2_error, "Sex", as.character(sex))
+
+# Assign fixed layout coordinates to the second network
+set.vertex.attribute(t2_error, "x", layout_fixed[, 1])
+set.vertex.attribute(t2_error, "y", layout_fixed[, 2])
+
+# Timepoint 2 visualization with only negative error
+ggnet2(t2_error, node.color = "Sex",
+       arrow.size = 3, arrow.gap = 0.015, 
+       node.size = 4, legend.position = "right",
+       mode = c("x", "y")) +
+  guides(size = F) +
+  scale_color_manual(
+    values = c("1" = "pink", "0" = "lightblue"),
+    labels = c("1" = "Girls", "0" = "Boys"),
+    name = "Sex") +
+  ggtitle("End network - Neg = 0.2, pos = 0") 
+  theme(plot.title = element_text(face = "bold"))
+  
+#### Visualizations with both errors ###  
+t2_pos <- netwobjects[[3]]
+set.vertex.attribute(t2_pos, "Sex", as.character(sex))
+
+# Assign fixed layout coordinates to the second network
+set.vertex.attribute(t2_pos, "x", layout_fixed[, 1])
+set.vertex.attribute(t2_pos, "y", layout_fixed[, 2])
+
+# Timepoint 2 visualization
+ggnet2(t2_pos, node.color = "Sex",
+       arrow.size = 3, arrow.gap = 0.015, 
+       node.size = 4, legend.position = "right",
+       mode = c("x", "y")) +
+  guides(size = F) +
+  scale_color_manual(
+    values = c("1" = "pink", "0" = "lightblue"),
+    labels = c("1" = "Girls", "0" = "Boys"),
+    name = "Sex") +
+  ggtitle("End network - Neg = 0.2, pos = 0.001") 
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+## Explore triad census and Homophily
+```{r}
+# Assess the average change of the triad census over time
+triad_census_names <- c("error_pos", "error_neg", "netw", colnames(triad.census(netwmatrices[[1]])))
+triad_census_df  <- data.frame(matrix(ncol = length(triad_census_names), nrow = 28))
+
+homophily_names <- c("error_pos", "error_neg", "netw", "Homophily")
+homophily_df <- data.frame(matrix(ncol = length(homophily_names), nrow = 28))
+
+# Calculat eaverage triad statistics
+for (i in 1:nrow(error_combo)){
+  neg <- error_combo[i, 1]
+  pos <- error_combo[i, 2]
+  
+  error_indices <- intersect(which(random_formatted$error_neg == neg), 
+                             which(random_formatted$error_pos == pos))
+  
+  data <- random_formatted$analyzed_networks[error_indices]
+  all_triads_1 <- sapply(lapply(data, function(arr) arr[,,1]), triad.census)
+  all_triads_2 <- sapply(lapply(data, function(arr) arr[,,2]), triad.census)
+  homophily_1 <- sapply(lapply(data, function(arr) arr[,,1]), function(x) PropSameSex(x, sex))
+  homophily_2 <- sapply(lapply(data, function(arr) arr[,,1]), function(x) PropSameSex(x, sex))
+  
+  triad_census_df[i,] <- c(pos, neg, "netw1", rowMeans(all_triads_1))
+  triad_census_df[i + 14,] <- c(pos, neg, "netw2", rowMeans(all_triads_2))
+  homophily_df[i,] <- c(pos, neg, "netw1", mean(homophily_1))
+  homophily_df[i + 14,] <- c(pos, neg, "netw2", mean(homophily_2))
+}
+
+colnames(triad_census_df) <- triad_census_names
+colnames(homophily_df) <- homophily_names
+write_xlsx(list(Triad_Census = triad_census_df, 
+           Homophily = homophily_df),
+           "../Results/Random/ExtraResults.xlsx")
+
+# Plot results triad census
+triad_columns <- colnames(triad_census_df)[!(colnames(triad_census_df) %in% c("error_pos", "error_neg", "netw"))]
+df_triads_long <- triad_census_df %>%
+  mutate(across(-netw, as.numeric)) %>%
+  pivot_longer(cols = all_of(triad_columns), names_to = "triad_type", values_to = "count") %>%
+  group_by(triad_type) %>%
+  mutate(
+    # Standardize the count per triad type
+    count_std = (count - mean(count, na.rm = TRUE)) / sd(count, na.rm = TRUE)
+  )
+
+label_axes <- labeller(netw = c(netw1 = "Start Network", netw2 = "End Network"), 
+                                 error_pos = c("0" = "Positive Error: .000", "0.001" = "Positive Error: .001"))
+
+triad_plot <- ggplot(df_triads_long, aes(x = error_neg, y = count_std, color = triad_type)) +
+  geom_line() +
+  scale_color_manual(values = c(
+    brewer.pal(9, "Set1"),
+    brewer.pal(7, "Set2"))) +
+  facet_grid(netw ~ error_pos, scales = "free_y", labeller = label_axes) +
+  labs(
+    title = "",
+    x = "Amount of Negative Error",
+    y = "Standardized Triad Count",
+    color = "Triad Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")  +
+  theme(axis.title.y = element_text(margin = margin(r = 15), size = 15),
+      axis.title.x = element_text(margin = margin(t = 15), size = 15),
+      strip.text = element_text(size = 14))
+
+triad_plot
+
+ggsave("../Results/Random/triad_census_plot.jpg", plot = triad_plot, width = 16, height = 10, dpi = 300)
+```
+
+# Isolate 0-scenario to use in systematic scenario-analysis
+```{r}
+scen0_pars <- random_results$filtered_output$theta %>% filter(Error_Neg == 0)
+scen0_convergence <- rerun_stats %>% filter(Error_Neg == 0)
+scen0_netwstats <- random_results$summary_networkstats %>% filter(Error_Neg == 0)
+scen0_paramstats <- random_results$summary_theta %>% filter(Error_Neg == 0)
+
+saveRDS(scen0_pars, "../Results/Systematic/scen0_pars")
+saveRDS(scen0_convergence, "../Results/Systematic/scen0_convergence")
+saveRDS(scen0_netwstats, "../Results/Systematic/scen0_netwstats")
+saveRDS(scen0_paramstats, "../Results/Systematic/scen0_paramstats")
+``` 

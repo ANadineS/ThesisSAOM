@@ -1,0 +1,206 @@
+---
+title: "DataExploration"
+author: "Astrid Stulemeijer"
+date: "2024-10-03"
+output: html_document
+---
+
+```{r preparation}
+# R packages
+library(RSiena)
+library(dplyr)
+library(ggplot2)
+library(psych)
+library(igraph)
+library(sna)
+library(network)
+library(RColorBrewer)
+library(GGally)
+library(reshape2)
+library(kableExtra)
+library(jmuOutlier)
+library(parallel)
+
+
+# Data
+load("../Data/Input/Glasgow-friendship.RData")
+load("../Data/Input/Glasgow-demographic.RData")
+
+# Source scripts
+source("./HelperFunctions.R")
+
+set.seed(2809)
+```
+
+# Network data exploration
+```{r data-cleaning & descriptives}
+# Create releavnt network objects
+noresponse_1 <- apply(friendship.2, 1, function(row) all(is.na(row) | row == 10))
+noresponse_2 <- apply(friendship.3, 1, function(row) all(is.na(row) | row == 10))
+inactive <- noresponse_1 | noresponse_2
+
+netwmatrices <- list(friendship.2[!inactive, !inactive], friendship.3[!inactive, !inactive]) %>%
+  lapply(., function(x) apply(x,1, function(y) replace(y,y == 2, 1))) 
+
+netwobjects <- lapply(netwmatrices, function(x) network(x, directed = T))
+
+age2 <- age[!inactive]
+sex <- ifelse(sex.F[!inactive] == 1, 0, 1)
+
+# Assess descriptive variables of students and networks
+mean(age2)
+sd(age2)
+
+indeg <- lapply(netwmatrices, function(x) rowSums(x,na.rm = T))
+outdeg <- lapply(netwmatrices, function(x) colSums(x,na.rm = T))
+
+# Timepoint 1 - Attach sex variable
+t1_original <- netwobjects[[1]]
+set.vertex.attribute(t1_original, "Sex", as.character(sex))
+
+# Timepoint 2 - Attach sex variable
+t2_original <- netwobjects[[2]]
+set.vertex.attribute(t2_original, "Sex", as.character(sex))
+
+# Set fixed layout for network grahs to aid comparison over time
+t1_igraph <- graph_from_adjacency_matrix(as.matrix.network.adjacency(t1_original), mode = "directed")
+layout_fixed <- layout_with_fr(t1_igraph)
+
+# Assign fixed layout coordinates to the first network
+set.vertex.attribute(t1_original, "x", layout_fixed[, 1])
+set.vertex.attribute(t1_original, "y", layout_fixed[, 2])
+
+# Assign fixed layout coordinates to the second network
+set.vertex.attribute(t2_original, "x", layout_fixed[, 1])
+set.vertex.attribute(t2_original, "y", layout_fixed[, 2])
+
+# Timepoint 1 visualization
+ggnet2(t1_original, node.color = "Sex",
+       arrow.size = 3, arrow.gap = 0.015, 
+       node.size = 4, legend.position = "right",
+       mode = c("x", "y")) +
+  guides(size = F) +
+  scale_color_manual(
+    values = c("1" = "pink", "0" = "lightblue"),
+    labels = c("Girls", "Boys"),
+    name = "Sex") +
+  ggtitle("Friendship network by sex and indegree centrality - Timepoint 1") +
+  theme(plot.title = element_text(face = "bold"))
+
+# Timepoint 2 visualization
+ggnet2(t2_original, node.color = "Sex",
+       arrow.size = 3, arrow.gap = 0.015, 
+       node.size = 4, legend.position = "right",
+       mode = c("x", "y")) +
+  guides(size = F) +
+  scale_color_manual(
+    values = c("1" = "pink", "0" = "lightblue"),
+    labels = c("1" = "Girls", "0" = "Boys"),
+    name = "Sex") +
+  ggtitle("Friendship network by sex and indegree centrality - Timepoint 2") +
+  theme(plot.title = element_text(face = "bold")) 
+
+# Summarizing statistics of original network data
+netwstats <- data.frame(
+  "Network size" = sapply(netwobjects, network.size),
+  "Density" = sapply(netwobjects, gden),
+  "Components" = sapply(netwobjects, components),
+  "Transitivity" = sapply(netwobjects, function(x) gtrans(x, mode = "graph")),
+  "Reciprocity" = sapply(netwobjects, function(x) grecip (x, measure = "edgewise")),
+  "Diameter" = sapply(netwobjects, Med_Distance)
+)
+```
+
+# Homophily
+```{r}
+# Function to calculate the proportion of same-sex ties
+proportion_same_sex_ties <- function(network_matrix, sex_vector) {
+  # Create an adjacency matrix indicating same-sex ties
+  same_sex_matrix <- outer(sex_vector, sex_vector, FUN = "==") * network_matrix
+  
+  # Calculate total ties and same-sex ties
+  total_ties <- sum(network_matrix, na.rm = TRUE)
+  same_sex_ties <- sum(same_sex_matrix, na.rm = TRUE)
+  
+  # Calculate proportion
+  if (total_ties > 0) {
+    return(same_sex_ties / total_ties)
+  } else {
+    return(NA)  # Return NA if there are no ties
+  }
+}
+
+# Calculate for both network matrices
+proportions <- sapply(netwmatrices, proportion_same_sex_ties, sex_vector = sex)
+```
+
+# Check stability and change of networks
+```{r}
+hamming <- function(net1,net2) {
+	tbl <- table(c(0,0,1,1,net1),c(0,1,0,1,net2))-1
+	return(tbl[1,2]+tbl[2,1])
+}
+
+jaccard <- function(net1,net2) {
+	tbl <- table(c(0,0,1,1,net1),c(0,1,0,1,net2))-1
+	return(tbl[2,2]/(tbl[1,2]+tbl[2,1]+tbl[2,2]))
+}
+
+hamming(netwmatrices[[1]], netwmatrices[[2]])
+jaccard(netwmatrices[[1]], netwmatrices[[2]])
+# quite some change, but acceptable stability
+```
+
+# Original SAOM estimation
+```{r}
+# SAOM on observed glasgow data
+friendship <- sienaDependent(array(c(netwmatrices[[1]], netwmatrices[[2]]), dim = c(133,133,2)))
+sex2 <- coCovar(sex, centered = F)
+glasgowdata <- sienaDataCreate(friendship, sex2)
+
+effects <- getEffects(glasgowdata)
+effects <- includeEffects(effects, name = "friendship", density, recip, cycle3, gwespFF, transRecTrip, inPop, inAct)
+effects <- includeEffects(effects, name = "friendship", sameX, interaction1 = "sex2") # Defines homophily based on sex
+
+controls <- sienaAlgorithmCreate(seed = 2809)
+results <- siena07(controls, data = glasgowdata, effects = effects)
+```
+
+## Target statistics of the SAOM - averaged over the actors
+```{r}
+typical_SAOM_counts <- data.frame("name" = results$effects$effectName, 
+                                  "average_target" = results$targets/133)
+```
+
+## Results and fit of original SAOM
+```{r}
+# Significance tests of SAOM results
+wald <- results$theta/results$se
+pvals <- pnorm(abs(wald), lower.tail = F)
+
+# Fit graphs for outdegree, indegree and triad census
+simcontrols <- sienaAlgorithmCreate(n3 = 500, nsub = 0, seed = 2809)
+thesims <- siena07(simcontrols, data = glasgowdata, effects = effects, 
+                   returnDeps = T, prevAns = results)
+
+(gofIndegrees <- sienaGOF(thesims, varName = "friendship",
+	IndegreeDistribution,
+	cumulative = FALSE, levls = 0:11)) 
+
+png(filename="../Results/Exploration/IndegreeGOF.png", width = 1800, height = 1200)
+plot(gofIndegrees) 
+dev.off()
+
+(gofOutdegrees <- sienaGOF(thesims, varName = "friendship",
+	OutdegreeDistribution, cumulative = FALSE, levls = 0:6)) 
+
+png(filename="../Results/Exploration/OutdegreeGOF.png", width = 1800, height = 1200)
+plot(gofOutdegrees)
+dev.off()
+
+(gofTriads <- sienaGOF(thesims, varName = "friendship", TriadCensus, verbose = TRUE))
+
+png(filename="../Results/Exploration/TriadsGOF.png", width = 1800, height = 1200)
+plot(gofTriads,center = TRUE, scale = TRUE)
+dev.off()
+```
